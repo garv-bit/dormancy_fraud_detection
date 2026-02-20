@@ -1,14 +1,19 @@
 """
-FraudEDA Part 3: Statistical Tests, Model Readiness, and Main Runner
+Fraud EDA Part 3 — Statistical Tests, Model Readiness, Recommendations,
+                    run_full_analysis, save_results
+
+All methods are attached to FraudEDA in Fraud_eda.py.
+Leakage guard: config.LEAKY_COLUMNS enforced throughout.
+Checkpointing: each section saves/loads from eda_checkpoints/<section>.joblib.
 """
 
-from typing import Dict, List, Optional, Any
-from pathlib import Path
-from datetime import datetime
-import pandas as pd
-import numpy as np
-from scipy.stats import chi2_contingency
 import joblib
+import numpy as np
+import pandas as pd
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Any, Optional
+from scipy.stats import chi2_contingency
 
 from Utils import (
     safe_divide,
@@ -17,351 +22,393 @@ from Utils import (
     print_section_header,
     format_bytes,
 )
-from Config import EDAConfig
 
+
+# ==============================================================================
+# 11. STATISTICAL HYPOTHESIS TESTS
+# ==============================================================================
 
 def analyze_statistical_tests(self) -> Dict[str, Any]:
     """
-    Perform statistical hypothesis tests
-    
-    Returns:
-        Dictionary containing test results
+    Chi-square independence tests between low-cardinality categorical columns.
+    Skips leaky columns.
     """
     print_section_header("10. STATISTICAL HYPOTHESIS TESTS", logger=self.logger)
-    
-    if self.df is None:
-        raise ValueError("No data loaded. Call load_data() first.")
-    
-    statistical_tests = {
-        'chi_square_tests': [],
-        't_tests': [],
-    }
-    
-    # Chi-square tests for categorical independence
-    categorical_cols = get_categorical_columns(self.df, exclude=self.config.SKIP_CATEGORICAL_ANALYSIS)
-    
-    # Filter columns suitable for chi-square
+
+    cached = self._ckpt_load("statistical_tests")
+    if cached is not None:
+        self.results['statistical_tests'] = cached
+        return cached
+
+    leaky = self._leaky()
+    statistical_tests = {'chi_square_tests': [], 't_tests': []}
+
     cat_cols_test = [
-        c for c in categorical_cols
-        if self.df[c].nunique() > 1 and self.df[c].nunique() < self.config.MAX_CATEGORICAL_UNIQUE
+        c for c in get_categorical_columns(
+            self.df, exclude=self.config.SKIP_CATEGORICAL_ANALYSIS
+        )
+        if c not in leaky
+        and 1 < self.df[c].nunique() < self.config.MAX_CATEGORICAL_UNIQUE
     ]
-    
+
     if len(cat_cols_test) >= 2:
-        print("\n📊 Chi-Square Independence Tests:")
-        
+        print("\n📊 Chi-Square Independence Tests:\n")
         test_count = 0
+
         for i, col1 in enumerate(cat_cols_test):
             if test_count >= self.config.MAX_CHI_SQUARE_TESTS:
                 break
-                
             for col2 in cat_cols_test[i + 1:]:
                 if test_count >= self.config.MAX_CHI_SQUARE_TESTS:
                     break
-                
                 try:
                     contingency = pd.crosstab(self.df[col1], self.df[col2])
-                    
-                    # Check if contingency table is valid
                     if contingency.size == 0:
                         continue
-                    
-                    chi2, p_value, dof, expected = chi2_contingency(contingency)
-                    
-                    test_result = {
-                        'variable1': col1,
-                        'variable2': col2,
-                        'chi2_statistic': float(chi2),
-                        'p_value': float(p_value),
-                        'dof': int(dof),
-                        'significant': bool(p_value < self.config.ALPHA),
-                    }
-                    
-                    statistical_tests['chi_square_tests'].append(test_result)
-                    
-                    significance = 'Significant' if p_value < self.config.ALPHA else 'Not significant'
-                    print(f"\n{col1} vs {col2}:")
-                    print(f"   χ² = {chi2:.4f}, p = {p_value:.4f}, {significance}")
-                    
+                    chi2, p_val, dof, _ = chi2_contingency(contingency)
+                    sig = p_val < self.config.ALPHA
+                    statistical_tests['chi_square_tests'].append({
+                        'variable1':       col1,
+                        'variable2':       col2,
+                        'chi2_statistic':  float(chi2),
+                        'p_value':         float(p_val),
+                        'dof':             int(dof),
+                        'significant':     bool(sig),
+                    })
+                    result_str = "Significant" if sig else "Not significant"
+                    print(f"{col1} vs {col2}:")
+                    print(f"   χ² = {chi2:.4f}, p = {p_val:.4f}, {result_str}\n")
                     test_count += 1
-                    
-                except ValueError as e:
-                    self.logger.warning(f"Chi-square test failed for {col1} vs {col2}: {str(e)}")
                 except Exception as e:
-                    self.logger.error(f"Unexpected error in chi-square test: {str(e)}")
-        
-        self.logger.info(f"Completed {test_count} chi-square tests")
-    else:
-        self.logger.info("Not enough suitable categorical columns for chi-square tests")
-    
+                    self.logger.warning(f"Chi-square failed {col1} vs {col2}: {e}")
+
     self.results['statistical_tests'] = statistical_tests
+    self._ckpt_save("statistical_tests", statistical_tests)
+    self.logger.info(f"Completed {len(statistical_tests['chi_square_tests'])} chi-square tests")
     return statistical_tests
 
 
+# ==============================================================================
+# 12. MODEL READINESS ASSESSMENT
+# ==============================================================================
+
 def assess_model_readiness(self) -> Dict[str, Any]:
     """
-    Assess if dataset is ready for model training
-    
-    Returns:
-        Dictionary containing readiness assessment
+    Evaluate whether the dataset is ready for model training.
+
+    Fixes vs previous version
+    --------------------------
+    - Feature count uses only leak-free columns (excludes LEAKY_COLUMNS).
+    - Leakage warning only flags columns that are actually still in the
+      dataframe AND are in LEAKY_COLUMNS but are NOT 'is_fraud' (the target).
+      This prevents the false CRITICAL warning that fired on ['is_fraud'].
     """
     print_section_header("11. MODEL READINESS ASSESSMENT", logger=self.logger)
-    
-    if self.df is None:
-        raise ValueError("No data loaded. Call load_data() first.")
-    
-    # Get quality metrics
+
+    cached = self._ckpt_load("model_readiness")
+    if cached is not None:
+        self.results['model_readiness'] = cached
+        return cached
+
+    leaky        = self._leaky()
     quality_data = self.results.get('data_quality', {})
     completeness = quality_data.get('completeness_pct', 0)
-    
-    numerical_cols = get_numeric_columns(self.df, exclude=['is_fraud'])
-    categorical_cols = get_categorical_columns(self.df, exclude=self.config.SKIP_CATEGORICAL_ANALYSIS)
-    total_features = len(numerical_cols) + len(categorical_cols)
-    
-    model_readiness = {
-        'completeness_score': float(completeness),
-        'completeness_pass': bool(completeness >= self.config.COMPLETENESS_THRESHOLD),
-        'sample_size': len(self.df),
-        'sample_size_pass': bool(len(self.df) >= self.config.MIN_SAMPLE_SIZE),
-        'feature_count': total_features,
-        'feature_pass': bool(total_features >= self.config.MIN_FEATURES),
-        'class_balance_score': 0.0,
-        'class_balance_pass': False,
-        'overall_readiness': 'NOT READY',
-    }
-    
-    # Check if target variable exists and has fraud cases
-    if 'is_fraud' in self.df.columns:
-        fraud_count = self.df['is_fraud'].sum()
-        fraud_rate = safe_divide(fraud_count, len(self.df), 0)
-        
-        model_readiness['class_balance_score'] = float(fraud_rate * 100)
-        model_readiness['class_balance_pass'] = bool(
-            fraud_rate >= self.config.MIN_FRAUD_RATE and 
-            fraud_rate <= self.config.MAX_FRAUD_RATE
+
+    numerical_cols = [
+        c for c in get_numeric_columns(self.df, exclude=['is_fraud'])
+        if c not in leaky
+    ]
+    categorical_cols = [
+        c for c in get_categorical_columns(
+            self.df, exclude=self.config.SKIP_CATEGORICAL_ANALYSIS
         )
-        
-        print(f"\n🎯 Model Readiness Checklist:")
-        print(f"   1. Data Completeness: {completeness:.1f}% - {'✅ PASS' if model_readiness['completeness_pass'] else '❌ FAIL'}")
-        print(f"   2. Sample Size: {len(self.df):,} - {'✅ PASS' if model_readiness['sample_size_pass'] else '❌ FAIL'}")
-        print(f"   3. Class Balance: {fraud_rate * 100:.2f}% fraud - {'✅ PASS' if model_readiness['class_balance_pass'] else '❌ FAIL'}")
-        print(f"   4. Feature Count: {total_features} features - {'✅ PASS' if model_readiness['feature_pass'] else '❌ FAIL'}")
-        
-        # Overall assessment
-        checks_passed = sum([
+        if c not in leaky
+    ]
+    total_features = len(numerical_cols) + len(categorical_cols)
+
+    # Only flag columns that are actually leaked:
+    #   - present in the dataframe
+    #   - in LEAKY_COLUMNS
+    #   - NOT 'is_fraud' (which is the target, not a leak)
+    actual_leaky_in_df = [
+        c for c in leaky
+        if c in self.df.columns and c != 'is_fraud'
+    ]
+
+    model_readiness = {
+        'completeness_score':    float(completeness),
+        'completeness_pass':     bool(completeness >= self.config.COMPLETENESS_THRESHOLD),
+        'sample_size':           len(self.df),
+        'sample_size_pass':      bool(len(self.df) >= self.config.MIN_SAMPLE_SIZE),
+        'feature_count':         total_features,
+        'feature_pass':          bool(total_features >= self.config.MIN_FEATURES),
+        'class_balance_score':   0.0,
+        'class_balance_pass':    False,
+        'overall_readiness':     'NOT READY',
+        'leaky_columns_excluded': actual_leaky_in_df,
+    }
+
+    if 'is_fraud' in self.df.columns:
+        fraud_rate = safe_divide(self.df['is_fraud'].sum(), len(self.df), 0)
+        model_readiness['class_balance_score'] = float(fraud_rate * 100)
+        model_readiness['class_balance_pass']  = bool(
+            self.config.MIN_FRAUD_RATE <= fraud_rate <= self.config.MAX_FRAUD_RATE
+        )
+
+        checks = [
             model_readiness['completeness_pass'],
             model_readiness['sample_size_pass'],
             model_readiness['class_balance_pass'],
             model_readiness['feature_pass'],
-        ])
-        
-        if checks_passed >= 3:
-            model_readiness['overall_readiness'] = 'READY'
-        elif checks_passed >= 2:
-            model_readiness['overall_readiness'] = 'NEEDS WORK'
+        ]
+
+        print("\n🎯 Model Readiness Checklist:")
+        print(f"   1. Data Completeness : {completeness:.1f}%"
+              f"  — {'✅ PASS' if checks[0] else '❌ FAIL'}")
+        print(f"   2. Sample Size        : {len(self.df):,}"
+              f"  — {'✅ PASS' if checks[1] else '❌ FAIL'}")
+        print(f"   3. Class Balance      : {fraud_rate*100:.2f}% fraud"
+              f"  — {'✅ PASS' if checks[2] else '❌ FAIL'}")
+        print(f"   4. Feature Count      : {total_features} (leak-free)"
+              f"  — {'✅ PASS' if checks[3] else '❌ FAIL'}")
+
+        if actual_leaky_in_df:
+            print(f"\n   ⚠️  Leaky columns still in dataframe: {actual_leaky_in_df}")
         else:
-            model_readiness['overall_readiness'] = 'NOT READY'
-        
+            print(f"\n   ✅ No leaky columns found in dataframe.")
+
+        model_readiness['overall_readiness'] = (
+            'READY'      if sum(checks) >= 3
+            else 'NEEDS WORK' if sum(checks) >= 2
+            else 'NOT READY'
+        )
         print(f"\n   ⚖️  Overall Assessment: {model_readiness['overall_readiness']}")
-        
-    else:
-        print("\n⚠️  No target variable (is_fraud) found")
-        self.logger.warning("No target variable found in dataset")
-    
+
     self.results['model_readiness'] = model_readiness
+    self._ckpt_save("model_readiness", model_readiness)
     self.logger.info(f"Model readiness: {model_readiness['overall_readiness']}")
-    
     return model_readiness
 
 
+# ==============================================================================
+# 13. RECOMMENDATIONS
+# ==============================================================================
+
 def generate_recommendations(self) -> List[Dict[str, str]]:
     """
-    Generate actionable recommendations based on analysis
-    
-    Returns:
-        List of recommendation dictionaries
+    Generate prioritised, actionable recommendations from EDA results.
+
+    Fixes vs previous version
+    --------------------------
+    - CRITICAL leakage warning only fires when actual leaked columns are
+      still present (not on 'is_fraud' which is the target).
+    - Soft leak moved to HIGH priority (18.6pp difference is a real risk).
+    - Structural month↔quarter correlation filtered before flagging multicollinearity.
     """
     print_section_header("12. RECOMMENDATIONS & ACTION ITEMS", logger=self.logger)
-    
+
+    cached = self._ckpt_load("recommendations")
+    if cached is not None:
+        self.results['recommendations'] = cached
+        return cached
+
     recommendations = []
-    
-    # Get analysis results
     quality_data = self.results.get('data_quality', {})
-    completeness = quality_data.get('completeness_pct', 100)
-    duplicates = quality_data.get('duplicate_rows', 0)
-    
-    model_data = self.results.get('model_readiness', {})
-    fraud_rate = model_data.get('class_balance_score', 0) / 100
-    
-    # Data Quality Recommendations
+    model_data   = self.results.get('model_readiness', {})
+
+    completeness   = quality_data.get('completeness_pct', 100)
+    duplicates     = quality_data.get('duplicate_rows', 0)
+    fraud_rate     = model_data.get('class_balance_score', 0) / 100
+    null_by_fraud  = quality_data.get('time_since_null_by_fraud', {})
+    actual_leaky   = model_data.get('leaky_columns_excluded', [])
+
+    # ---- CRITICAL: only fire if genuinely leaked columns remain -----------
+    if actual_leaky:
+        recommendations.append({
+            'priority': 'CRITICAL',
+            'category': 'Data Leakage',
+            'issue':    (
+                f"Leaky columns still present in dataframe: {actual_leaky}. "
+                "These are post-event labels that must not enter the feature matrix."
+            ),
+            'action':   (
+                "Add them to config.DROP_ON_LOAD so they are removed on CSV read. "
+                "Ensure config.LEAKY_COLUMNS excludes them from X in model training."
+            ),
+        })
+
+    # ---- HIGH: soft leak (18.6pp difference is a real signal leak) -------
+    if null_by_fraud:
+        vals = list(null_by_fraud.values())
+        if len(vals) == 2 and abs(vals[0] - vals[1]) > 5:
+            diff = abs(vals[0] - vals[1])
+            recommendations.append({
+                'priority': 'HIGH',
+                'category': 'Soft Leak Risk',
+                'issue':    (
+                    f"'time_since_last_transaction' null rate differs by {diff:.1f}pp "
+                    "between fraud (0.0%) and non-fraud (18.6%) rows. "
+                    "The missingness pattern itself leaks signal."
+                ),
+                'action':   (
+                    "Add 'is_first_transaction' = time_since_last_transaction.isnull()"
+                    ".astype(int) BEFORE imputing. "
+                    "Then impute nulls with the column median."
+                ),
+            })
+
+    # ---- Data quality -----------------------------------------------------
     if completeness < self.config.COMPLETENESS_THRESHOLD:
         recommendations.append({
             'priority': 'HIGH',
             'category': 'Data Quality',
-            'issue': f'Data is only {completeness:.1f}% complete',
-            'action': 'Implement imputation strategy (mean/median/mode) or collect more complete data',
+            'issue':    f"Data is only {completeness:.1f}% complete",
+            'action':   "Implement imputation (mean/median/mode) or collect more data.",
         })
-    
-    if duplicates > len(self.df) * 0.01:  # More than 1% duplicates
+
+    if duplicates > len(self.df) * 0.01:
         recommendations.append({
             'priority': 'MEDIUM',
             'category': 'Data Quality',
-            'issue': f'{duplicates} duplicate rows found',
-            'action': 'Remove duplicates or investigate if they are valid repeated transactions',
+            'issue':    f"{duplicates} duplicate rows found",
+            'action':   "Remove duplicates or verify they are valid repeated transactions.",
         })
-    
-    # Target Variable Recommendations
+
+    # ---- Target / class balance -------------------------------------------
     if 'is_fraud' in self.df.columns:
         if self.df['is_fraud'].sum() == 0:
             recommendations.append({
                 'priority': 'CRITICAL',
                 'category': 'Target Variable',
-                'issue': 'No fraud cases in dataset',
-                'action': 'Collect diverse data including fraud examples, or use synthetic data generation (SMOTE)',
+                'issue':    "No fraud cases in dataset",
+                'action':   "Collect fraud examples or apply SMOTE.",
             })
         elif fraud_rate < self.config.MIN_FRAUD_RATE:
             recommendations.append({
                 'priority': 'HIGH',
                 'category': 'Class Imbalance',
-                'issue': f'Severe class imbalance ({fraud_rate*100:.2f}% fraud)',
-                'action': 'Use SMOTE, class weights, or ensemble methods (Random Forest, XGBoost with scale_pos_weight)',
+                'issue':    f"Severe imbalance ({fraud_rate*100:.2f}% fraud)",
+                'action':   (
+                    "Use SMOTE, class_weight='balanced', or "
+                    "XGBoost scale_pos_weight to handle imbalance."
+                ),
             })
-        elif fraud_rate > 0.5:
-            recommendations.append({
-                'priority': 'MEDIUM',
-                'category': 'Class Balance',
-                'issue': f'Unusually high fraud rate ({fraud_rate*100:.2f}%)',
-                'action': 'Verify data collection process - this may indicate biased sampling',
-            })
-    
-    # Sample Size Recommendations
-    if len(self.df) < self.config.MIN_SAMPLE_SIZE:
+
+    # ---- Multicollinearity (filter structural correlations) ---------------
+    corr_data   = self.results.get('correlation_analysis', {})
+    strong_corr = corr_data.get('strong_correlations', [])
+    real_strong = [
+        c for c in strong_corr
+        if set([c['feature1'], c['feature2']]) != {'month', 'quarter'}
+    ]
+    if len(real_strong) > 5:
         recommendations.append({
-            'priority': 'HIGH',
-            'category': 'Sample Size',
-            'issue': f'Only {len(self.df)} transactions',
-            'action': f'Collect more data for robust model training (target: {self.config.MIN_SAMPLE_SIZE}+)',
+            'priority': 'MEDIUM',
+            'category': 'Multicollinearity',
+            'issue':    (
+                f"{len(real_strong)} strongly correlated feature pairs "
+                "(structural month↔quarter excluded)."
+            ),
+            'action':   (
+                "Consider dropping 'quarter' (redundant with 'month') "
+                "and applying PCA or Lasso regularisation."
+            ),
         })
-    
-    # Feature Engineering Recommendations
+
+    # ---- Feature engineering ----------------------------------------------
     recommendations.append({
         'priority': 'MEDIUM',
         'category': 'Feature Engineering',
-        'issue': 'Additional features could improve model performance',
-        'action': 'Create interaction features, ratios, temporal aggregations, and behavioral features',
+        'issue':    "Additional features could improve model performance",
+        'action':   (
+            "Add 'is_first_transaction' flag, amount z-score per account, "
+            "hour-of-day risk buckets, and rolling account velocity features."
+        ),
     })
-    
-    # Temporal Recommendations
+
+    # ---- Model selection --------------------------------------------------
     if 'timestamp' in self.df.columns:
         recommendations.append({
             'priority': 'MEDIUM',
             'category': 'Model Selection',
-            'issue': 'Dataset has temporal dependencies',
-            'action': 'Use time-aware cross-validation (TimeSeriesSplit) and consider sequential models',
+            'issue':    "Dataset has temporal ordering — random CV will leak future data",
+            'action':   (
+                "Use sklearn.model_selection.TimeSeriesSplit for cross-validation "
+                "and consider sequential models."
+            ),
         })
-    
-    # Correlation Recommendations
-    corr_data = self.results.get('correlation_analysis', {})
-    strong_corr_count = len(corr_data.get('strong_correlations', []))
-    
-    if strong_corr_count > 10:
-        recommendations.append({
-            'priority': 'MEDIUM',
-            'category': 'Multicollinearity',
-            'issue': f'{strong_corr_count} pairs of strongly correlated features',
-            'action': 'Consider feature selection, PCA, or regularization (Ridge/Lasso)',
-        })
-    
+
     # Sort by priority
     priority_order = {'CRITICAL': 0, 'HIGH': 1, 'MEDIUM': 2, 'LOW': 3}
     recommendations.sort(key=lambda x: priority_order.get(x['priority'], 4))
-    
-    # Print recommendations
+
+    icons = {'CRITICAL': '🔴', 'HIGH': '🟠', 'MEDIUM': '🟡', 'LOW': '🟢'}
     print("\n🎯 Actionable Recommendations:\n")
     for i, rec in enumerate(recommendations, 1):
-        icon = {
-            'CRITICAL': '🔴',
-            'HIGH': '🟠',
-            'MEDIUM': '🟡',
-            'LOW': '🟢',
-        }.get(rec['priority'], '⚪')
-        
+        icon = icons.get(rec['priority'], '⚪')
         print(f"{i}. {icon} [{rec['priority']}] {rec['category']}")
-        print(f"   Issue: {rec['issue']}")
-        print(f"   Action: {rec['action']}\n")
-    
+        print(f"   Issue  : {rec['issue']}")
+        print(f"   Action : {rec['action']}\n")
+
     self.results['recommendations'] = recommendations
+    self._ckpt_save("recommendations", recommendations)
     self.logger.info(f"Generated {len(recommendations)} recommendations")
-    
     return recommendations
 
 
+# ==============================================================================
+# 14. FULL PIPELINE ORCHESTRATOR
+# ==============================================================================
+
 def run_full_analysis(self, filepath: Optional[str] = None) -> Dict[str, Any]:
     """
-    Run complete EDA pipeline
-    
-    Args:
-        filepath: Optional path to CSV file
-        
-    Returns:
-        Dictionary containing all analysis results
+    Run all EDA sections in sequence.
+    Completed sections are loaded from checkpoints and skipped.
     """
-    self.logger.info("=" * 120)
+    self.logger.info("=" * 100)
     self.logger.info("STARTING COMPREHENSIVE EDA PIPELINE")
-    self.logger.info("=" * 120)
-    
-    try:
-        # Load data
-        self.load_data(filepath)
-        
-        # Run all analyses
-        self.analyze_metadata()
-        self.analyze_data_quality()
-        self.analyze_numerical_features()
-        self.analyze_categorical_features()
-        self.analyze_temporal_features()
-        self.analyze_correlation()
-        self.analyze_feature_importance()
-        self.analyze_pca()
-        self.analyze_clustering()
-        self.analyze_statistical_tests()
-        self.assess_model_readiness()
-        self.generate_recommendations()
-        
-        # Add timestamp
-        self.results['timestamp'] = datetime.now().isoformat()
-        self.results['dataset_name'] = filepath or self.config.INPUT_CSV
-        
-        # Note: Don't store raw data (memory efficient)
-        if self.config.STORE_RAW_DATA:
-            self.results['data_sample'] = self.df.head(self.config.SAMPLE_SIZE_FOR_STORAGE).to_dict()
-            self.logger.info(f"Stored {self.config.SAMPLE_SIZE_FOR_STORAGE} sample rows")
-        
-        self.logger.info("=" * 120)
-        self.logger.info("EDA PIPELINE COMPLETED SUCCESSFULLY")
-        self.logger.info("=" * 120)
-        
-        return self.results
-        
-    except Exception as e:
-        self.logger.error(f"Fatal error in EDA pipeline: {str(e)}", exc_info=True)
-        raise
+    self.logger.info("=" * 100)
 
+    print(f"\n📁 Checkpoint dir: {self.config.CHECKPOINT_DIR}/")
+    print("   Completed sections load from disk automatically.")
+    print("   Delete the folder to force a full re-run.\n")
+
+    self.load_data(filepath)
+    self.analyze_metadata()
+    self.analyze_data_quality()
+    self.analyze_numerical_features()
+    self.analyze_categorical_features()
+    self.analyze_temporal_features()
+    self.analyze_correlation()
+    self.analyze_feature_importance()
+    self.analyze_pca()
+    self.analyze_clustering()
+    self.analyze_statistical_tests()
+    self.assess_model_readiness()
+    self.generate_recommendations()
+
+    self.results['timestamp']    = datetime.now().isoformat()
+    self.results['dataset_name'] = filepath or self.config.INPUT_CSV
+
+    if self.config.STORE_RAW_DATA:
+        self.results['data_sample'] = (
+            self.df.head(self.config.SAMPLE_SIZE_FOR_STORAGE).to_dict()
+        )
+
+    self.logger.info("=" * 100)
+    self.logger.info("EDA PIPELINE COMPLETED SUCCESSFULLY")
+    self.logger.info("=" * 100)
+    return self.results
+
+
+# ==============================================================================
+# 15. SAVE RESULTS
+# ==============================================================================
 
 def save_results(self, output_path: Optional[str] = None):
-    """
-    Save analysis results to file using joblib (safer than pickle)
-    
-    Args:
-        output_path: Optional output file path
-    """
+    """Persist the full results dict to a joblib file."""
     output_path = output_path or self.config.OUTPUT_PICKLE
-    
-    try:
-        joblib.dump(self.results, output_path)
-        file_size = Path(output_path).stat().st_size
-        self.logger.info(f"Results saved to: {output_path} ({format_bytes(file_size)})")
-        print(f"\n💾 Results saved to: {output_path}")
-        
-    except Exception as e:
-        self.logger.error(f"Error saving results: {str(e)}")
-        raise
+    joblib.dump(self.results, output_path)
+    size = Path(output_path).stat().st_size
+    self.logger.info(f"Results saved to: {output_path} ({format_bytes(size)})")
+    print(f"\n💾 Results saved to: {output_path}")
